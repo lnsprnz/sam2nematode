@@ -1,0 +1,107 @@
+"""
+This script is used to run the SAM2.1 model on a video and add new points or boxes to the inference state.
+"""
+
+# Import necessary libraries
+import os
+import numpy as np
+import torch
+import matplotlib.pyplot as plt
+from PIL import Image
+from DataLoader import load_json  # Your custom loader
+
+# Fallback for Apple MPS
+os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"
+
+# Select device
+if torch.cuda.is_available():
+    device = torch.device("cuda")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+else:
+    device = torch.device("cpu")
+print(f"Using device: {device}")
+
+# CUDA settings
+if device.type == "cuda":
+    torch.autocast("cuda", dtype=torch.bfloat16).__enter__()
+    if torch.cuda.get_device_properties(0).major >= 8:
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+elif device.type == "mps":
+    print("\nMPS support is preliminary. SAM2 trained with CUDA may behave differently.")
+
+from sam2.build_sam import build_sam2_video_predictor
+
+# Paths (Set your correct paths here)
+sam2_checkpoint = "../checkpoints/sam2.1_hiera_large.pt"
+model_cfg = "configs/sam2.1/sam2.1_hiera_l.yaml"
+
+# ------------------------- FUNCTIONS ------------------------- #
+
+def load_keypoints(predictor, inference_state, json_path):
+    # Load keypoints and labels
+    keypoints, labels = load_json(json_path)
+
+    object_counters = {}  # To track per-class object counts
+    out_obj_ids_all = []
+    out_mask_logits_all = []
+
+    for i in range(len(keypoints)):
+        point = keypoints[i].reshape(1, 2)
+        label = np.array([1], dtype=np.int32)  # Always 1 for positive click
+
+        class_id = labels[i]
+
+        # Keep per-class counters
+        if class_id not in object_counters:
+            object_counters[class_id] = 1
+        else:
+            object_counters[class_id] += 1
+
+        obj_id = class_id * 10000 + object_counters[class_id]
+
+        # Add point to predictor
+        _, out_obj_ids, out_mask_logits = predictor.add_new_points_or_box(
+            inference_state=inference_state,
+            frame_idx=0,  # Assuming frame 0, adjust if needed
+            obj_id=obj_id,
+            points=point,
+            labels=label,
+        )
+
+        out_obj_ids_all.append(out_obj_ids)
+        out_mask_logits_all.append(out_mask_logits)
+
+    return out_obj_ids_all, out_mask_logits_all
+
+def annotate_video(predictor, inference_state, output_path):
+    # Propagate annotations through the video
+    video_segments = {}
+
+    for out_frame_idx, out_obj_ids, out_mask_logits in predictor.propagate_in_video(inference_state):
+        video_segments[out_frame_idx] = {
+            out_obj_id: (out_mask_logits[i] > 0.0).cpu().numpy()
+            for i, out_obj_id in enumerate(out_obj_ids)
+        }
+
+    # TODO: Save video_segments if needed
+    # Save or visualize your results here
+    print(f"Annotation done. {len(video_segments)} frames processed.")
+
+def main():
+    video_dir = "your_video_path_here.mp4"
+    json_path = "your_json_path_here.json"
+    output_path = "your_output_path_here"
+
+    predictor = build_sam2_video_predictor(model_cfg, sam2_checkpoint, device=device)
+    inference_state = predictor.init_state(video_path=video_dir)
+
+    # First, load and add keypoints
+    load_keypoints(predictor, inference_state, json_path)
+
+    # Then propagate through the video
+    annotate_video(predictor, inference_state, output_path)
+
+
+main()
